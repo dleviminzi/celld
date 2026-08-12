@@ -456,6 +456,9 @@ pub enum CellJob {
         body: Vec<u8>,
         headers: Vec<(String, String)>,
         reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
+        /// Completes only after this event has left the isolate loop, which can
+        /// be later than `reply`; early terminal errors close the channel.
+        event_done: tokio::sync::oneshot::Sender<()>,
     },
     /// Run the worker's `export default fetch` INSIDE this cell isolate. When
     /// the worker routes `env.NS.get(id)` to a scope this isolate owns, the DO
@@ -1272,7 +1275,7 @@ fn complete_fetch_event<'s>(
             cell_rx,
             critical_scope,
             request_id,
-            false,
+            critical_scope.is_some(),
             |tc, value| {
                 if let Some(error) = critical_scope.and_then(storage::sql_critical_error) {
                     return Err(anyhow!(error));
@@ -1363,6 +1366,7 @@ fn handle_reentrant_job(
             body,
             headers,
             reply,
+            event_done,
         } => {
             let result = register_actor_name(tc, &scope, name.as_deref()).and_then(|()| {
                 call_dispatch_to(
@@ -1379,6 +1383,7 @@ fn handle_reentrant_job(
                 )
             });
             let _ = reply.send(result);
+            let _ = event_done.send(());
         }
         CellJob::Rpc {
             scope,
@@ -2377,6 +2382,7 @@ impl Worker {
         request: FetchRequest<'_>,
         rx: &std::sync::mpsc::Receiver<CellJob>,
         reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
+        event_done: tokio::sync::oneshot::Sender<()>,
     ) {
         let context_g = self.context.clone();
         v8::scope!(let hs, &mut self.isolate);
@@ -2447,6 +2453,7 @@ impl Worker {
             request.request_id,
             reply,
         );
+        let _ = event_done.send(());
     }
 
     /// Invoke one public method on a DO instance (Cloudflare native RPC),
@@ -7799,13 +7806,237 @@ fn read_response(
     })
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(test)]
 fn init_engine_for_tests() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         v8::V8::set_flags_from_string("--expose-gc");
         Engine::init();
     });
+}
+
+#[cfg(test)]
+mod lifecycle_regression_tests {
+    use super::*;
+    use anyhow::Context as _;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn durable_object_drains_detached_io_after_publishing_response() {
+        init_engine_for_tests();
+
+        // Hold an actual outbound fetch open until the test releases it. This
+        // makes response publication versus event completion observable
+        // without relying on sleeps or scheduler timing.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+        listener
+            .set_nonblocking(true)
+            .expect("make test server interruptible");
+        let endpoint = format!("http://{}/hold", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (server_stop_tx, server_stop_rx) = mpsc::channel();
+        let (server_result_tx, server_result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if server_stop_rx.try_recv().is_ok() {
+                                anyhow::bail!("test stopped before outbound fetch connected");
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                let mut request = [0_u8; 4096];
+                anyhow::ensure!(stream.read(&mut request)? > 0, "empty HTTP request");
+                accepted_tx
+                    .send(())
+                    .map_err(|_| anyhow!("test stopped before accepting request"))?;
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .context("test did not release HTTP response")?;
+                stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )?;
+                Ok(())
+            })();
+            let _ = server_result_tx.send(result);
+        });
+
+        let source = format!(
+            r#"
+                let done = false;
+                export class TestDo {{
+                    async runFiber() {{
+                        await fetch({endpoint:?});
+                        done = true;
+                    }}
+                    fetch(request) {{
+                        if (new URL(request.url).pathname === "/start") {{
+                            void this.runFiber();
+                            return new Response("accepted", {{ status: 202 }});
+                        }}
+                        return new Response(done ? "yes" : "no");
+                    }}
+                }}
+                export default {{
+                    fetch() {{ return new Response("unused"); }}
+                }};
+            "#,
+        );
+        let scope = "TestDo:detached-io".to_string();
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        let (event_done, mut event_finished) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (worker_result_tx, worker_result_rx) = mpsc::channel();
+        let (cell_tx, cell_rx) = std::sync::mpsc::channel();
+        let reentrant_scope = scope.clone();
+        thread::spawn(move || {
+            asyncrt::init();
+            let result = (|| -> Result<(u16, Vec<u8>)> {
+                storage::open(&scope, ":memory:")?;
+                let mut worker = Worker::load(
+                    WorkerConfigOptions {
+                        src: source,
+                        script_name: "lifecycle-test".into(),
+                        do_classes: vec!["TestDo".into()],
+                        bindings: Vec::new(),
+                        r2_bindings: Vec::new(),
+                        ai_binding: None,
+                        vars: Vec::new(),
+                        node: "test-node".into(),
+                        text: Vec::new(),
+                        compat: Compat::default(),
+                    },
+                    std::slice::from_ref(&scope),
+                )?;
+                ready_tx
+                    .send(())
+                    .map_err(|_| anyhow!("test stopped before worker was ready"))?;
+                start_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .context("test did not start Durable Object request")?;
+                worker.dispatch_to_and_reply(
+                    &scope,
+                    FetchRequest {
+                        url: "http://object/start",
+                        method: "GET",
+                        body: &[],
+                        headers: &[],
+                        request_id: None,
+                    },
+                    &cell_rx,
+                    reply,
+                    event_done,
+                );
+
+                let (status_reply, status_rx) = tokio::sync::oneshot::channel();
+                let (status_done, _status_finished) = tokio::sync::oneshot::channel();
+                worker.dispatch_to_and_reply(
+                    &scope,
+                    FetchRequest {
+                        url: "http://object/status",
+                        method: "GET",
+                        body: &[],
+                        headers: &[],
+                        request_id: None,
+                    },
+                    &cell_rx,
+                    status_reply,
+                    status_done,
+                );
+                let response = status_rx
+                    .blocking_recv()
+                    .context("status response sender dropped")??;
+                Ok((response.status, response.body))
+            })();
+            storage::close(&scope);
+            let _ = worker_result_tx.send(result);
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker did not become ready");
+        start_tx.send(()).expect("start worker request");
+        let (published_tx, published_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = published_tx.send(reply_rx.blocking_recv());
+        });
+
+        let published = published_rx.recv_timeout(Duration::from_secs(5));
+        let accepted = accepted_rx.recv_timeout(Duration::from_secs(5));
+        let (reentrant_reply, reentrant_reply_rx) = tokio::sync::oneshot::channel();
+        let (reentrant_done, mut reentrant_finished) = tokio::sync::oneshot::channel();
+        let reentrant_queued = cell_tx
+            .send(CellJob::Fetch {
+                request_id: None,
+                scope: reentrant_scope,
+                name: None,
+                url: "http://object/status".into(),
+                method: "GET".into(),
+                body: Vec::new(),
+                headers: Vec::new(),
+                reply: reentrant_reply,
+                event_done: reentrant_done,
+            })
+            .is_ok();
+        let (reentrant_published_tx, reentrant_published_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = reentrant_published_tx.send(reentrant_reply_rx.blocking_recv());
+        });
+        let reentrant_response = reentrant_published_rx.recv_timeout(Duration::from_secs(5));
+        let reentrant_completion = reentrant_finished.try_recv();
+        let completion_before_release = event_finished.try_recv();
+        // Always release the server before asserting, so a failing test does
+        // not strand the worker thread in its event loop.
+        let _ = server_stop_tx.send(());
+        let _ = release_tx.send(());
+        let worker_result = worker_result_rx.recv_timeout(Duration::from_secs(5));
+        let server_result = server_result_rx.recv_timeout(Duration::from_secs(5));
+        let completion_after_release = event_finished.try_recv();
+
+        let response = published
+            .expect("Durable Object did not publish its response")
+            .expect("response sender dropped")
+            .expect("Durable Object response failed");
+        assert_eq!(response.status, 202);
+        accepted.expect("detached outbound fetch never reached server");
+        assert!(matches!(
+            completion_before_release,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            reentrant_queued,
+            "event loop stopped before reentrant request"
+        );
+        let reentrant_response = reentrant_response
+            .expect("blocked event did not service reentrant request")
+            .expect("reentrant response sender dropped")
+            .expect("reentrant status request failed");
+        assert_eq!(
+            (reentrant_response.status, reentrant_response.body),
+            (200, b"no".to_vec())
+        );
+        assert_eq!(reentrant_completion, Ok(()));
+        assert_eq!(
+            worker_result
+                .expect("worker did not finish after I/O release")
+                .expect("worker failed"),
+            (200, b"yes".to_vec())
+        );
+        server_result
+            .expect("test server did not finish")
+            .expect("test server failed");
+        assert_eq!(completion_after_release, Ok(()));
+    }
 }
 
 /// Externally injected Web-platform tests.

@@ -97,6 +97,15 @@ pub struct RuntimeFetch {
     pub request_id: Option<js::RequestId>,
 }
 
+/// The response and the later completion of the Durable Object event that
+/// produced it. A response may be ready while detached event I/O is still
+/// running, so lifecycle owners must retain their activity token until both
+/// response-side work and `event_done` have finished.
+pub struct CellFetch {
+    pub response: anyhow::Result<HttpResponse>,
+    pub event_done: tokio::sync::oneshot::Receiver<()>,
+}
+
 /// The node's replication engine: the in-process `celld-ltx` replicator,
 /// hidden behind this wrapper so nothing else touches the backend directly.
 #[derive(Clone)]
@@ -690,7 +699,7 @@ impl RuntimeManager {
         name: Option<String>,
         request: RuntimeFetch,
         cancel: Option<tokio::sync::oneshot::Receiver<()>>,
-    ) -> anyhow::Result<HttpResponse> {
+    ) -> anyhow::Result<CellFetch> {
         let RuntimeFetch {
             url,
             method,
@@ -707,6 +716,7 @@ impl RuntimeManager {
             .map(|handle| handle.tx.clone())
             .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))?;
         let (reply, mut receive) = tokio::sync::oneshot::channel();
+        let (event_done, event_finished) = tokio::sync::oneshot::channel();
         let scope = cell.clone();
         let send = || {
             tx.send(CellJob::Fetch {
@@ -718,6 +728,7 @@ impl RuntimeManager {
                 body,
                 headers,
                 reply,
+                event_done,
             })
             .map_err(|_| anyhow!("cell isolate stopped"))
         };
@@ -750,10 +761,14 @@ impl RuntimeManager {
                 .expect("abort registry poisoned")
                 .remove(&request_id);
         }
-        js::drain_arm_gates(&scope)
-            .await
-            .map_err(|error| anyhow!(error))?;
-        result
+        let response = match js::drain_arm_gates(&scope).await {
+            Ok(()) => result,
+            Err(error) => Err(anyhow!(error)),
+        };
+        Ok(CellFetch {
+            response,
+            event_done: event_finished,
+        })
     }
 
     /// Tell a cell to abandon a fetch, by name.
@@ -1223,6 +1238,7 @@ fn run_cell(
                 body,
                 headers,
                 reply,
+                event_done,
             } => {
                 if let Some(name) = name {
                     if let Err(error) = worker.set_id_name(&scope, &name) {
@@ -1241,6 +1257,7 @@ fn run_cell(
                     },
                     &rx,
                     reply,
+                    event_done,
                 );
             }
             CellJob::WorkerFetch {

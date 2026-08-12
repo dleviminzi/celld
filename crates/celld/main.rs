@@ -17,7 +17,9 @@ use celld::js::{
 };
 use celld::ownership_store::{now_ms, S3Ownership};
 use celld::peer_auth::{self, PeerAuth};
-use celld::runtime::{CohostedWorker, Replication, RuntimeFetch, RuntimeManager, RuntimeOptions};
+use celld::runtime::{
+    CellFetch, CohostedWorker, Replication, RuntimeFetch, RuntimeManager, RuntimeOptions,
+};
 use celld_logic::{
     on_event, CasGuard, CasOutcome, Config, Effect, Event, Failure, LeaseCasOutcome, NodeLeaseMode,
     NodeLeaseRecord, NodeLeaseSpec, OpId, OwnerRecord, OwnershipOnEvict, Phase, RequestError,
@@ -361,6 +363,24 @@ struct ActivityGuard {
     request: u64,
     runtime: Option<RuntimeManager>,
     cell: String,
+}
+
+impl ActivityGuard {
+    /// Transfer the request's lifecycle pin to post-response event work. The
+    /// caller invokes this only after response-side WebSocket registration and
+    /// output gating have completed, so one token continuously covers both
+    /// phases without double-counting activity in the decision core.
+    fn finish_after(self, mut event_done: oneshot::Receiver<()>) {
+        if matches!(
+            event_done.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ) {
+            tokio::spawn(async move {
+                let _ = event_done.await;
+                drop(self);
+            });
+        }
+    }
 }
 
 impl Drop for ActivityGuard {
@@ -2226,10 +2246,10 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
             let (node, addr, epoch, peer_protocol) = match route {
                 Route::Local => {
                     let dispatch_started = Instant::now();
-                    let _activity = app.activity(request, scope.clone());
-                    let result = async {
+                    let activity = app.activity(request, scope.clone());
+                    let fetched = async {
                         let runtime = app.runtime.as_ref().context("no cell runtime")?;
-                        let response = runtime
+                        runtime
                             .fetch_cell(
                                 scope.clone(),
                                 name,
@@ -2242,17 +2262,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                                 },
                                 cancel.take(),
                             )
-                            .await?;
-                        if let Some(target) = &response.ws {
-                            let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
-                                WebSocketKind::Hibernatable
-                            } else {
-                                WebSocketKind::Regular
-                            };
-                            app.websocket_opened(target.scope.clone(), target.id, kind)
-                                .await?;
-                        }
-                        Ok(response)
+                            .await
                     }
                     .await;
                     // Output gate (RPO=0): a handler that advanced the cell's
@@ -2260,14 +2270,36 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                     // the cell durable. The request is still pinned (the
                     // activity guard has not dropped), so it fails rather than
                     // acknowledges a write the node cannot prove durable.
-                    let result = match result {
-                        Ok(response) => match response.write_position.filter(|_| app.output_gate) {
-                            Some(position) => match app.gate_write(request, position).await {
-                                Ok(()) => Ok(response),
-                                Err(error) => Err(anyhow::Error::new(RoutedRequestError(error))),
-                            },
-                            None => Ok(response),
-                        },
+                    let result = match fetched {
+                        Ok(CellFetch {
+                            response,
+                            event_done,
+                        }) => {
+                            let result: anyhow::Result<HttpResponse> = async {
+                                let response = response?;
+                                if let Some(target) = &response.ws {
+                                    let kind =
+                                        if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
+                                            WebSocketKind::Hibernatable
+                                        } else {
+                                            WebSocketKind::Regular
+                                        };
+                                    app.websocket_opened(target.scope.clone(), target.id, kind)
+                                        .await?;
+                                }
+                                if let Some(position) =
+                                    response.write_position.filter(|_| app.output_gate)
+                                {
+                                    app.gate_write(request, position).await.map_err(|error| {
+                                        anyhow::Error::new(RoutedRequestError(error))
+                                    })?;
+                                }
+                                Ok(response)
+                            }
+                            .await;
+                            activity.finish_after(event_done);
+                            result
+                        }
                         Err(error) => Err(error),
                     };
                     if let Some(timing) = websocket_timing.as_mut() {
@@ -2686,7 +2718,7 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
             request,
             route: Route::Local,
         }) => {
-            let _activity = app.activity(request, scope.clone());
+            let activity = app.activity(request, scope.clone());
             let Some(runtime) = &app.runtime else {
                 return response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime");
             };
@@ -2717,7 +2749,10 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                 )
                 .await
             {
-                Ok(worker_response) => {
+                Ok(CellFetch {
+                    response: worker_response,
+                    event_done,
+                }) => {
                     abort.request_id = None;
                     // Output gate (RPO=0): a peer-served handler that advanced
                     // the cell's committed position holds its reply until the
@@ -2726,33 +2761,50 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                     // — the loss the takeover tests catch. The activity guard
                     // is still alive, so the request stays pinned across the
                     // wait.
-                    if let Some(position) =
-                        worker_response.write_position.filter(|_| app.output_gate)
-                    {
-                        if let Err(error) = app.gate_write(request, position).await {
-                            return peer_response(response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("durability unproven: {error:?}"),
-                            ));
+                    let result = match worker_response {
+                        Ok(worker_response) => {
+                            let prepared: Result<HttpReply, HttpReply> = async {
+                                if let Some(position) =
+                                    worker_response.write_position.filter(|_| app.output_gate)
+                                {
+                                    if let Err(error) = app.gate_write(request, position).await {
+                                        return Err(response(
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            format!("durability unproven: {error:?}"),
+                                        ));
+                                    }
+                                }
+                                if let Some(target) = &worker_response.ws {
+                                    let kind =
+                                        if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
+                                            WebSocketKind::Hibernatable
+                                        } else {
+                                            WebSocketKind::Regular
+                                        };
+                                    if let Err(error) = app
+                                        .websocket_opened(target.scope.clone(), target.id, kind)
+                                        .await
+                                    {
+                                        return Err(response(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            format!(
+                                                "WebSocket core registration failed: {error:#}"
+                                            ),
+                                        ));
+                                    }
+                                }
+                                Ok(peer_runtime_response(worker_response))
+                            }
+                            .await;
+                            prepared.unwrap_or_else(|error_response| error_response)
                         }
-                    }
-                    if let Some(target) = &worker_response.ws {
-                        let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
-                            WebSocketKind::Hibernatable
-                        } else {
-                            WebSocketKind::Regular
-                        };
-                        if let Err(error) = app
-                            .websocket_opened(target.scope.clone(), target.id, kind)
-                            .await
-                        {
-                            return peer_response(response(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                format!("WebSocket core registration failed: {error:#}"),
-                            ));
-                        }
-                    }
-                    peer_runtime_response(worker_response)
+                        Err(error) => response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("cell Worker failed: {error:#}"),
+                        ),
+                    };
+                    activity.finish_after(event_done);
+                    result
                 }
                 Err(error) => response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -5402,5 +5454,45 @@ impl Drop for AbortPeerFetchOnHangUp {
         if let Some(request_id) = self.request_id {
             self.runtime.abort_fetch(&self.scope, request_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_regression_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn activity_guard_waits_for_event_completion() {
+        let (messages, mut received) = mpsc::unbounded_channel();
+        let activity = ActivityGuard {
+            tx: messages,
+            request: 41,
+            runtime: None,
+            cell: "TestDo:detached-io".into(),
+        };
+        let (event_done, event_finished) = oneshot::channel();
+
+        activity.finish_after(event_finished);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        event_done.send(()).expect("completion receiver alive");
+        let message = tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .expect("activity guard did not finish")
+            .expect("activity channel closed");
+        assert!(matches!(
+            message,
+            Message::ActivityFinished {
+                request: 41,
+                cell,
+                alarm_at_ms: None,
+                alarm_covered: false,
+            } if cell == "TestDo:detached-io"
+        ));
     }
 }
