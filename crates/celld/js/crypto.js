@@ -166,7 +166,19 @@
           visibility,
           passphrase: null,
         });
-        return _makeKey(visibility, algorithm, extractable, usages, {
+        let reported = algorithm;
+        if (imported.keyType === "rsa" && name.startsWith("RSA")) {
+          const exponent = [];
+          for (let n = BigInt(imported.details.publicExponent); n; n >>= 8n)
+            exponent.unshift(Number(n & 255n));
+          reported = {
+            ...algorithm,
+            modulusLength: imported.details.modulusLength,
+            publicExponent: Uint8Array.from(exponent),
+            hash: { name: _hashName(algorithm?.hash) },
+          };
+        }
+        return _makeKey(visibility, reported, extractable, usages, {
           bytes: Uint8Array.from(imported.der),
           keyType: imported.keyType,
           details: imported.details,
