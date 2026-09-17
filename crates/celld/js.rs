@@ -29,6 +29,9 @@ use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 pub(crate) mod input_gate_lifecycle;
 use input_gate_lifecycle::{CrossEntryGateClaim, CrossEntryGateClaims};
 
+mod http_error;
+use http_error::response_stream_error;
+
 #[cfg(all(test, celld_internal_tests))]
 fn test_host_services() -> Arc<crate::host_services::HostServices> {
     asyncrt::services()
@@ -10822,7 +10825,7 @@ async fn next_http_stream_chunk(source: &mut HttpStreamSource) -> Result<Option<
             .chunk()
             .await
             .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
-            .map_err(|error| format!("response stream: {error}")),
+            .map_err(response_stream_error),
         HttpStreamSource::Receiver(receiver) => match receiver.recv().await {
             Some(Ok(bytes)) => Ok(Some(bytes)),
             Some(Err(error)) => Err(error),
@@ -10947,7 +10950,7 @@ fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
         HttpStreamSource::Response(response) => Box::pin(response.bytes_stream().map(|chunk| {
             chunk
                 .map(|bytes| bytes.to_vec())
-                .map_err(|error| format!("response stream: {error}"))
+                .map_err(response_stream_error)
         })),
         HttpStreamSource::Receiver(receiver) => {
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
