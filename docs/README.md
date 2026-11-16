@@ -487,9 +487,18 @@ Concurrent stops do not flood the survivors: a draining node claims a
 fleet drain token, so nodes hand off one at a time. A node that cannot
 claim the token within its wait proceeds without it.
 
-A new process does not report healthy until the fleet settles: no node
-drains, every node is below its memory low watermark, the restore backlogs
-are small, and ownership is balanced. At `CELLD_READY_FLEET_GATE_MS`,
+A new process does not report healthy until the fleet can accept another
+paced drain: no donor holds the token, no live node reports memory pressure,
+and restoration has returned within the previous donor's baseline budget.
+Normally every node must be below its memory low watermark. A fresh paced
+successor with positive headroom, no restoration backlog, and fewer resident
+cells than the busiest incumbent can instead supply that capacity. This
+exception requires all live peers to support paced handoff and none to be
+draining; it prevents a circular wait when incumbents sit between the memory
+low and high watermarks and therefore do not shed. Capacity samples older
+than 30 seconds cannot grant the exception. Receiver admission still checks
+each cell during handoff; readiness is not a reservation of an entire donor's
+memory. Ownership skew also blocks unless the successor can absorb it. At `CELLD_READY_FLEET_GATE_MS`,
 celld logs `ready_gate_expired` once, but readiness stays closed, so set
 an orchestrator rollout deadline. After the first healthy response, fleet
 state does not remove readiness.

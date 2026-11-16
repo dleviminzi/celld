@@ -56,7 +56,9 @@ pub enum FleetUnsettled {
 
 /// Whether the joining node can receive ownership during the next paced
 /// drain. The node contributes only when its lease is live, it advertises the
-/// handoff protocol, and it owns less than the busiest incumbent.
+/// handoff protocol, has a recent positive capacity sample and no restoration
+/// backlog, and hosts fewer resident cells than the busiest incumbent.
+/// Ownership counts include dormant cells and do not measure this capacity.
 pub fn joining_contributes_successor_capacity(
     peers: &[crate::CapacityPeer],
     node: &str,
@@ -70,6 +72,13 @@ pub fn joining_contributes_successor_capacity(
         .find(|peer| peer.node == node)
         .is_some_and(|joining| {
             joining.paced_handoff
+                && !joining.draining
+                && !joining.pressured
+                && joining.memory_headroom == Some(true)
+                && joining.restoring == 0
+                && joining.sampled_ms > 0
+                && joining.sampled_ms <= now_ms
+                && now_ms - joining.sampled_ms <= 30_000
                 && live
                     .iter()
                     .filter(|peer| peer.node != node)
@@ -80,9 +89,10 @@ pub fn joining_contributes_successor_capacity(
 }
 
 /// Evaluate the drain token and the successor capacity published in live node
-/// leases. The joining node must publish itself. Every live peer must have
-/// memory headroom, each live node must return to its pre-donor restore
-/// baseline, and incumbent ownership must fit the successor-share envelope.
+/// leases. Actual memory pressure always blocks. Incumbents between the low
+/// and high memory watermarks can use a healthy paced successor instead of
+/// waiting for shedding that starts only at the high watermark. An active
+/// donor and restoration beyond the pre-donor baseline still block.
 pub fn fleet_status(
     existing: Option<&DrainToken>,
     node: &str,
@@ -101,9 +111,18 @@ pub fn fleet_status(
     if !live.iter().any(|peer| peer.node == node) {
         return Err(FleetUnsettled::SelfUnpublished);
     }
+    // Readiness authorizes the next donor, whose paced handoff checks receiver
+    // admission on every cell. It need not require spare memory on every old
+    // node as well: those nodes cannot shed below the pressure high watermark,
+    // so requiring the low watermark here deadlocks an otherwise usable surge
+    // node. Keep the conservative rule for mixed protocols and active drains.
+    let successor_capacity = joining_contributes_successor_capacity(peers, node, now_ms)
+        && live.iter().all(|peer| peer.paced_handoff && !peer.draining);
     if let Some(node) = live
         .iter()
-        .filter(|peer| peer.pressured || peer.memory_headroom == Some(false))
+        .filter(|peer| {
+            peer.pressured || (peer.memory_headroom == Some(false) && !successor_capacity)
+        })
         .map(|peer| &peer.node)
         .min()
     {
