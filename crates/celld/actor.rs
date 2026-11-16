@@ -1793,6 +1793,7 @@ impl AppHandle {
                         serde_json::json!({
                             "generation": generation.id(),
                             "version": generation.version(),
+                            "draining_ms": generation.draining_ms(),
                             "isolates": generation.isolate_census(),
                         })
                     })

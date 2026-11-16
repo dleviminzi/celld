@@ -183,6 +183,7 @@ pub struct Slot {
     queue_producers: Mutex<std::collections::HashMap<String, usize>>,
     turns: AtomicUsize,
     requests: AtomicUsize,
+    generation_retirement: Arc<GenerationRetirement>,
     /// The pool's admission bell, cloned into every slot so an
     /// `Affiliation` drop can ring it without holding the pool.
     freed: Arc<tokio::sync::Notify>,
@@ -217,6 +218,20 @@ pub(crate) fn current_slot() -> Option<Arc<Slot>> {
 }
 
 impl Slot {
+    /// Wait without holding an isolate, but do not let suspended work keep a
+    /// superseded generation alive indefinitely. The caller owns cleanup;
+    /// dropping an in-flight V8 entry instead would strand its gates and ops.
+    pub(crate) async fn before_generation_deadline<T>(
+        &self,
+        work: impl std::future::Future<Output = T>,
+    ) -> Result<T, ()> {
+        crate::asyncrt::select_biased! {
+            "generation retirement wins even when operations continuously complete";
+            _ = self.generation_retirement.expired() => Err(()),
+            result = work => Ok(result),
+        }
+    }
+
     fn observe(&self) -> IsolateLoad {
         IsolateLoad {
             turns: self.turns.load(Ordering::Relaxed),
@@ -328,6 +343,7 @@ impl Slot {
             queue_producers: Mutex::new(std::collections::HashMap::new()),
             turns: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
+            generation_retirement: Arc::new(GenerationRetirement::default()),
             freed: Arc::new(tokio::sync::Notify::new()),
             reclaim: None,
             loaded_worker,
@@ -360,6 +376,7 @@ impl Slot {
             queue_producers: Mutex::new(std::collections::HashMap::new()),
             turns: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
+            generation_retirement: Arc::new(GenerationRetirement::default()),
             freed: Arc::new(tokio::sync::Notify::new()),
             reclaim: None,
             loaded_worker: false,
@@ -536,6 +553,52 @@ impl Drop for Residency {
     }
 }
 
+/// Shared by the pool and every slot it creates. Ordinary idle isolate
+/// retirement does not set this deadline: only a superseded generation does.
+struct GenerationRetirement {
+    deadline: tokio::sync::watch::Sender<Option<u64>>,
+}
+
+impl Default for GenerationRetirement {
+    fn default() -> Self {
+        Self {
+            deadline: tokio::sync::watch::channel(None).0,
+        }
+    }
+}
+
+impl GenerationRetirement {
+    fn retire(&self, grace: std::time::Duration) {
+        let deadline = crate::asyncrt::mono_ms()
+            .saturating_add(grace.as_millis().min(u64::MAX as u128) as u64);
+        // A repeated retirement must not extend an old generation's life.
+        self.deadline.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(deadline);
+                true
+            }
+        });
+    }
+
+    async fn expired(&self) {
+        let mut deadline = self.deadline.subscribe();
+        loop {
+            let current = *deadline.borrow_and_update();
+            if let Some(at) = current {
+                crate::asyncrt::sleep_until(at).await;
+                return;
+            }
+            // `self` retains a sender throughout this wait.
+            deadline
+                .changed()
+                .await
+                .expect("retirement sender is alive");
+        }
+    }
+}
+
 type Build = Box<dyn Fn() -> Result<js::Worker> + Send + Sync>;
 
 pub struct Pool {
@@ -552,6 +615,7 @@ pub struct Pool {
     /// the old generation just before the flip can still land, but nothing
     /// it builds outlives the work it was built for.
     retired: AtomicBool,
+    generation_retirement: Arc<GenerationRetirement>,
     /// Keeps admission and cell placement from racing isolate retirement.
     /// Stateless admission takes a shared guard, while maintenance and cell
     /// placement take the exclusive guard.
@@ -568,6 +632,7 @@ impl Pool {
             reclaim: Arc::new(tokio::sync::Notify::new()),
             admission_wait,
             retired: AtomicBool::new(false),
+            generation_retirement: Arc::new(GenerationRetirement::default()),
             maintenance: RwLock::new(()),
         }
     }
@@ -630,6 +695,7 @@ impl Pool {
             queue_producers: Mutex::new(std::collections::HashMap::new()),
             turns: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
+            generation_retirement: self.generation_retirement.clone(),
             freed: self.freed.clone(),
             reclaim: Some(self.reclaim.clone()),
             loaded_worker: false,
@@ -810,6 +876,8 @@ impl Pool {
     pub fn retire_all(&self) {
         let _maintenance = self.maintenance.write().expect("pool poisoned");
         self.retired.store(true, Ordering::Relaxed);
+        self.generation_retirement
+            .retire(crate::generation::max_age());
         for slot in self.slots.read().expect("pool poisoned").iter() {
             if !slot.retiring.swap(true, Ordering::Relaxed) {
                 tracing::info!(isolate = %slot.heap_id, slot = slot.id, "isolate retiring");

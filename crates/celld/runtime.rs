@@ -2271,7 +2271,7 @@ async fn drive_worker(
     after_turn(&entry);
 
     while !entry.finished() {
-        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
+        let started = match wake_for_slot(slot, &mut ops, &mut entry, budget).await {
             Wake::Op(op, result) => {
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
@@ -2367,6 +2367,24 @@ fn take_cancellation_wake(request_id: Option<js::RequestId>) -> Option<Wake> {
 /// This is the whole of what a request does between turns, and it is
 /// deliberately the only place that waits: everything else in `drive` either
 /// holds the isolate or is arithmetic.
+async fn wake_for_slot(
+    slot: &crate::pool::Slot,
+    ops: &mut Ops,
+    entry: &mut js::InFlight,
+    budget: Duration,
+) -> Wake {
+    slot.before_generation_deadline(wake_with_cross_entry_gate(ops, entry, budget))
+        .await
+        .unwrap_or_else(|()| {
+            tracing::warn!(
+                event = "deployment_request_expired",
+                isolate = slot.id,
+                "superseded generation grace elapsed; cancelling request and background work"
+            );
+            Wake::Cancelled { shutdown: true }
+        })
+}
+
 async fn wake_with_cross_entry_gate(
     ops: &mut Ops,
     entry: &mut js::InFlight,
@@ -3335,7 +3353,10 @@ async fn drive_cell_inner(
     // stop interleaving and the DO contract with them.
     let mut order = job.take_order();
     if let Some(order) = order.as_mut() {
-        order.wait().await;
+        if slot.before_generation_deadline(order.wait()).await.is_err() {
+            job.fail(anyhow!("The application generation was superseded"));
+            return Ok(None);
+        }
     }
     // Join the dispatching Worker's trace when there is one — the root
     // already made the sampling decision — else decide a fresh root.
@@ -3402,21 +3423,27 @@ async fn drive_cell_inner(
             Some(taken) => break taken,
             None => match waiting {
                 None => {}
-                Some(open) => match open.await {
+                Some(open) => match slot.before_generation_deadline(open).await {
+                    Err(()) => {
+                        if let Some(job) = pending.take() {
+                            job.fail(anyhow!("The application generation was superseded"));
+                        }
+                        return Ok(None);
+                    }
                     // The gate opened normally; try for the isolate again.
-                    Ok(Ok(())) => {}
+                    Ok(Ok(Ok(()))) => {}
                     // The critical section this event queued behind failed,
                     // which reset the cell. Delivering now would run against
                     // state that no longer exists, so refuse instead and say
                     // why the caller is being refused.
-                    Ok(Err(failure)) => {
+                    Ok(Ok(Err(failure))) => {
                         if let Some(job) = pending.take() {
                             job.fail(anyhow!(failure));
                         }
                         return Ok(None);
                     }
                     // The cell stopped while this event waited.
-                    Err(_) => return Ok(None),
+                    Ok(Err(_)) => return Ok(None),
                 },
             },
         }
@@ -3456,8 +3483,7 @@ async fn drive_cell_inner(
     }
 
     while !entry.finished() {
-        let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await
-        {
+        let (started, moves) = match wake_for_slot(&slot, &mut ops, &mut entry, budget).await {
             Wake::Op(op, result) => {
                 slot.turn(|worker| {
                     let started = worker.turn_deliver(&mut entry, op, result);

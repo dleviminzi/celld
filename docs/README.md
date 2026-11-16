@@ -247,7 +247,8 @@ A running node does not restart for a new deployment. Each node reads
 `deploy/current.json` every `CELLD_DEPLOY_POLL_S` seconds (default 30) and
 adopts a new deployment in place. `POST /reload` on the internal listener
 adopts it now, and also rebuilds an unchanged deployment. A request that
-started on the previous deployment finishes on it. A deployment that does
+started on the previous deployment finishes on it within the retirement grace
+period. A deployment that does
 not build leaves the current one serving, and the node reports the error
 in its log and in the `/reload` response.
 
@@ -262,7 +263,18 @@ forces the move: it cancels the running work and closes regular WebSockets
 with code 1012, as Cloudflare does. During the move, a request on one
 deployment can call a Durable Object on the other, so two adjacent
 versions must accept each other's calls. `/state` reports the deployment
-of each resident object.
+of each resident object. The same grace bounds suspended requests and
+`waitUntil` work in the superseded generation, including requests that have
+already answered and events waiting behind a cell's input gate. At expiry,
+celld uses lifecycle cancellation to retire that work before reclaiming its
+isolate; it never frees a heap while a request still references it. Requests
+on the current generation retain their normal handler/background semantics.
+
+`/state.deployment.draining` reports each old generation's `draining_ms` and
+isolate/request census. Alert if that age exceeds the configured grace plus
+reclamation allowance (maintenance runs every 30 seconds). The structured
+`deployment_request_expired` event identifies forced retirement; a persistent
+old generation after cancellation indicates cleanup is still stuck.
 
 ## Develop an application locally
 
@@ -663,7 +675,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_ESBUILD` | The path of the esbuild executable |
 | `CELLD_ACTIVATIONS` | Concurrent cold-cell activations (default: 8 per CPU, at least 16, at most 128) |
 | `CELLD_DEPLOY_POLL_S` | The deployment pointer poll interval in seconds (default: 30) |
-| `CELLD_DEPLOY_MAX_AGE_S` | Seconds before celld forces a resident Durable Object onto a new deployment (default: 60; 0 forces at once) |
+| `CELLD_DEPLOY_MAX_AGE_S` | Seconds before superseded-generation requests, background work, and resident Durable Objects are forced to retire (default: 60; 0 forces at once) |
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
 | `CELLD_MAX_CELL_REQUESTS` | Concurrent fetch events for one Durable Object (default: 64) |
 | `CELLD_MAX_REQUEST_BODY_BYTES` | The body limit for a public Worker request or a direct Durable Object request (default: 1 GiB) |

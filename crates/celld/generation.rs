@@ -93,10 +93,10 @@ pub fn poll_interval() -> std::time::Duration {
     std::time::Duration::from_secs(seconds)
 }
 
-/// How long a resident cell may keep running a superseded generation after
+/// How long requests and resident cells may keep a superseded generation after
 /// the node adopts a new one, before its swap is forced: its activity
-/// cancelled and its regular WebSockets closed with 1012. Zero forces every
-/// resident cell at the flip, which is what a Cloudflare deployment does.
+/// cancelled (including waitUntil), and its regular WebSockets closed with
+/// 1012. Zero forces retirement at the flip.
 /// `CELLD_DEPLOY_MAX_AGE_S`, default 60.
 pub fn max_age() -> std::time::Duration {
     // Not `positive_or`: zero is meaningful here.
@@ -279,6 +279,7 @@ pub struct GenerationOptions {
 /// the application handle. They are private and reached through
 /// `RuntimeManager`, which hands out this struct only as a snapshot.
 pub struct Generation {
+    retired_at_ms: std::sync::OnceLock<u64>,
     pub(crate) id: GenerationId,
     pub(crate) version: String,
     pub(crate) prefix: String,
@@ -385,12 +386,20 @@ impl Generation {
     /// isolates free as their affiliations drop; cell isolates free as their
     /// cells move to a newer generation.
     pub(crate) fn retire(&self) {
+        self.retired_at_ms.get_or_init(crate::asyncrt::mono_ms);
         for service in self.services.values() {
             service.isolates.retire_all();
         }
         for pool in self.cell_isolates.values() {
             pool.retire_all();
         }
+    }
+
+    /// How long this generation has been retiring, for operational alerts.
+    pub(crate) fn draining_ms(&self) -> Option<u64> {
+        self.retired_at_ms
+            .get()
+            .map(|started| crate::asyncrt::mono_ms().saturating_sub(*started))
     }
 
     /// Whether every isolate of this generation has been freed, so the
@@ -613,6 +622,7 @@ impl Generation {
             })
             .collect();
         Ok(Generation {
+            retired_at_ms: std::sync::OnceLock::new(),
             id,
             version,
             prefix,
